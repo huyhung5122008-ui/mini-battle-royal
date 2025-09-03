@@ -1,0 +1,306 @@
+# mini-battle-royal
+Create repository
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <title>Mini Battle Royale Prototype (Phaser 3)</title>
+  <style>body{margin:0;background:#111;color:#ddd;font-family:Inter,system-ui}</style>
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.55.2/dist/phaser.min.js"></script>
+</head>
+<body>
+<script>
+const CONFIG = {
+  type: Phaser.AUTO,
+  width: 900,
+  height: 600,
+  backgroundColor: '#1b2430',
+  physics: {
+    default: 'arcade',
+    arcade: { debug: false }
+  },
+  scene: { preload, create, update }
+};
+
+const game = new Phaser.Game(CONFIG);
+
+function preload() {
+  // no external images; we'll draw shapes
+}
+
+function create() {
+  const scene = this;
+
+  // World bounds (bigger than view to allow camera follow)
+  const worldSize = 2000;
+  scene.cameras.main.setBounds(0,0,worldSize,worldSize);
+  scene.physics.world.setBounds(0,0,worldSize,worldSize);
+
+  // Safe zone (initial big circle)
+  scene.safeRadius = 800;      // initial safe radius (from center)
+  scene.safeCenter = { x: worldSize/2, y: worldSize/2 };
+  scene.boShrinkTimer = 0;
+  scene.boShrinkInterval = 8000; // ms between shrinks
+  scene.boShrinkAmount = 80; // radius reduce per interval
+
+  // Graphics for world / zone
+  scene.zoneG = scene.add.graphics().setScrollFactor(0);
+  scene.zoneWorldG = scene.add.graphics();
+
+  // Player
+  scene.player = scene.add.circle(worldSize/2 + 100, worldSize/2, 14, 0x8ad0ff);
+  scene.physics.add.existing(scene.player);
+  scene.player.body.setCollideWorldBounds(true);
+  scene.player.hp = 100;
+  scene.player.maxHp = 100;
+  scene.player.speed = 200;
+
+  // camera follow
+  scene.cameras.main.startFollow(scene.player, true, 0.08, 0.08);
+
+  // Bullets group
+  scene.bullets = scene.physics.add.group({ classType: Phaser.GameObjects.Arc, allowGravity: false });
+  scene.bulletPool = scene.add.group();
+
+  // Bots
+  scene.bots = scene.physics.add.group();
+  spawnBots(scene, 8);
+
+  // Items (health packs)
+  scene.items = scene.physics.add.group();
+  spawnItems(scene, 6);
+
+  // Colliders
+  scene.physics.add.overlap(scene.bullets, scene.bots, (b, bot) => {
+    if (!bot.getData('alive')) return;
+    b.destroy();
+    bot.getData('hit')(10);
+  });
+  scene.physics.add.overlap(scene.bullets, scene.player, ()=>{}); // friendly fire off for now
+
+  scene.physics.add.overlap(scene.player, scene.items, (p, item)=>{
+    const heal = item.getData('heal') || 25;
+    p.hp = Math.min(p.maxHp, p.hp + heal);
+    item.destroy();
+  });
+
+  scene.physics.add.collider(scene.player, scene.bots, (p, bot)=>{
+    // collisions cause minor push
+  });
+
+  // UI text
+  scene.hud = scene.add.text(10,10,'', { font:'16px monospace', fill:'#fff' }).setScrollFactor(0);
+
+  // Input
+  scene.keys = scene.input.keyboard.addKeys('W,A,S,D');
+  scene.input.on('pointerdown', (pointer) => {
+    shoot(scene, pointer.worldX, pointer.worldY);
+  });
+
+  // Damage when outside safe zone
+  scene.lastDamageTick = 0;
+
+  // simple instructions
+  scene.add.text(12, CONFIG.height - 28, 'WASD to move • Click to shoot • Survive as zone shrinks', { font:'14px monospace', fill:'#ccc' }).setScrollFactor(0);
+}
+
+function update(time, delta) {
+  const s = this;
+  // Player movement
+  let vx = 0, vy = 0;
+  if (s.keys.W.isDown) vy = -1;
+  if (s.keys.S.isDown) vy = 1;
+  if (s.keys.A.isDown) vx = -1;
+  if (s.keys.D.isDown) vx = 1;
+  const mag = Math.hypot(vx,vy) || 1;
+  s.player.body.setVelocity((vx/mag)*s.player.speed, (vy/mag)*s.player.speed);
+
+  // Rotate player toward mouse
+  const pointer = s.input.activePointer;
+  // draw player direction indicator
+  // bots AI move
+  s.bots.getChildren().forEach(bot => updateBot(s, bot, delta));
+
+  // Shrink safe zone periodically
+  s.boShrinkTimer += delta;
+  if (s.boShrinkTimer > s.boShrinkInterval) {
+    s.boShrinkTimer = 0;
+    s.safeRadius = Math.max(120, s.safeRadius - s.boShrinkAmount);
+  }
+
+  // Damage outside zone
+  const dx = s.player.x - s.safeCenter.x;
+  const dy = s.player.y - s.safeCenter.y;
+  const dist = Math.hypot(dx,dy);
+  if (dist > s.safeRadius) {
+    if (time - s.lastDamageTick > 600) {
+      s.player.hp -= 6;
+      s.lastDamageTick = time;
+    }
+  }
+
+  // bullets update
+  s.bullets.getChildren().forEach(b => {
+    // destroy off world
+    if (b.x < 0 || b.x > s.physics.world.bounds.width || b.y < 0 || b.y > s.physics.world.bounds.height) {
+      b.destroy();
+    }
+  });
+
+  // draw zone & world overlay
+  drawZone(s);
+
+  // update HUD
+  const aliveBots = s.bots.getChildren().filter(b=>b.getData('alive')).length;
+  s.hud.setText(`HP: ${Math.max(0,Math.floor(s.player.hp))} / ${s.player.maxHp}   Zone radius: ${Math.floor(s.safeRadius)}   Bots: ${aliveBots}`);
+
+  // check player death
+  if (s.player.hp <= 0) {
+    s.scene.pause();
+    s.add.text(s.cameras.main.worldView.centerX - 120, s.cameras.main.worldView.centerY - 20, 'Bạn đã thua. F5 để chơi lại.', { font:'24px monospace', fill:'#ff6b6b' }).setScrollFactor(0);
+  }
+}
+
+function shoot(scene, tx, ty) {
+  const sx = scene.player.x;
+  const sy = scene.player.y;
+  const angle = Math.atan2(ty - sy, tx - sx);
+  const speed = 600;
+  const bullet = scene.physics.add.image(sx + Math.cos(angle)*20, sy + Math.sin(angle)*20, null);
+  bullet.setCircle(3);
+  bullet.setTint(0xffffaa);
+  bullet.setVelocity(Math.cos(angle)*speed, Math.sin(angle)*speed);
+  bullet.setDepth(2);
+  bullet.body.setAllowGravity(false);
+  scene.bullets.add(bullet);
+  // friendly: bullets won't hit player; but will hit bots via overlap
+  // optional: life timer
+  scene.time.addEvent({ delay: 2000, callback: ()=>bullet.destroy() });
+}
+
+function spawnBots(scene, n) {
+  for (let i=0;i<n;i++) {
+    const x = Phaser.Math.Between(200, scene.physics.world.bounds.width-200);
+    const y = Phaser.Math.Between(200, scene.physics.world.bounds.height-200);
+    const bot = scene.add.circle(x,y,12,0xffa68a);
+    scene.physics.add.existing(bot);
+    bot.getData = bot.getData || bot.data.get;
+    bot.setData = bot.setData || function(k,v){ this.data.set(k,v); return this; };
+    bot.data = bot.data || new Phaser.Data.DataManager(bot);
+    bot.data.set('alive', true);
+    bot.data.set('hp', 40);
+    bot.data.set('state', 'wander');
+    bot.data.set('target', {x:x,y:y});
+    bot.getData('hit') ? null : bot.setData('hit', (dmg)=>{
+      const hp = bot.data.get('hp') - dmg;
+      bot.data.set('hp', hp);
+      bot.setFillStyle(0xff7b5a);
+      if (hp <= 0) {
+        bot.data.set('alive', false);
+        bot.destroy();
+      } else {
+        // small knockback
+        // optional: set aggressive
+      }
+    });
+    scene.bots.add(bot);
+  }
+}
+
+function updateBot(scene, bot, delta) {
+  if (!bot.data || !bot.data.get('alive')) return;
+  const state = bot.data.get('state');
+  const tx = bot.data.get('target').x;
+  const ty = bot.data.get('target').y;
+  let vx=0, vy=0;
+  const speed = 60 + Math.random()*30;
+  const dist = Phaser.Math.Distance.Between(bot.x, bot.y, tx, ty);
+  if (dist < 10) {
+    // pick a new wander target occasionally
+    if (Math.random() < 0.02) {
+      const nx = bot.x + Phaser.Math.Between(-200,200);
+      const ny = bot.y + Phaser.Math.Between(-200,200);
+      bot.data.set('target', {x: Phaser.Math.Clamp(nx,50, scene.physics.world.bounds.width-50), y: Phaser.Math.Clamp(ny,50, scene.physics.world.bounds.height-50)});
+    }
+  } else {
+    vx = (tx - bot.x)/dist * speed;
+    vy = (ty - bot.y)/dist * speed;
+    bot.x += vx * (delta/1000);
+    bot.y += vy * (delta/1000);
+  }
+
+  // simple "see player" and shoot mechanic
+  const seeRange = 260;
+  const pdist = Phaser.Math.Distance.Between(bot.x, bot.y, scene.player.x, scene.player.y);
+  if (pdist < seeRange) {
+    // aim at player sometimes (shoot)
+    if (Math.random() < 0.01) {
+      const angle = Math.atan2(scene.player.y - bot.y, scene.player.x - bot.x);
+      const bullet = scene.physics.add.image(bot.x + Math.cos(angle)*16, bot.y + Math.sin(angle)*16, null);
+      bullet.setCircle(3);
+      bullet.setTint(0xffcc88);
+      const speedB = 300;
+      bullet.setVelocity(Math.cos(angle)*speedB, Math.sin(angle)*speedB);
+      scene.bullets.add(bullet);
+      // bullet hits player
+      scene.physics.add.overlap(bullet, scene.player, (b,p)=>{
+        p.hp -= 8;
+        b.destroy();
+      });
+      scene.time.addEvent({ delay: 3000, callback: ()=>bullet.destroy() });
+    }
+    // move a bit towards/away
+    const dir = Math.random() < 0.6 ? 1 : -1;
+    bot.x += (scene.player.x - bot.x) * 0.002 * dir * (delta/16);
+    bot.y += (scene.player.y - bot.y) * 0.002 * dir * (delta/16);
+  }
+}
+
+function spawnItems(scene, n) {
+  for (let i=0;i<n;i++) {
+    const x = Phaser.Math.Between(100, scene.physics.world.bounds.width-100);
+    const y = Phaser.Math.Between(100, scene.physics.world.bounds.height-100);
+    const itm = scene.add.rectangle(x,y,14,14,0x88ff9a);
+    scene.physics.add.existing(itm);
+    itm.setDataEnabled();
+    itm.data.set('heal', 25);
+    scene.items.add(itm);
+  }
+}
+
+function drawZone(scene) {
+  // world overlay (subtle)
+  scene.zoneWorldG.clear();
+  // draw world grid
+  const step = 200;
+  scene.zoneWorldG.lineStyle(1, 0x263244, 0.06);
+  for (let x=0; x<scene.physics.world.bounds.width; x+=step) {
+    scene.zoneWorldG.strokeLineShape(new Phaser.Geom.Line(x,0,x,scene.physics.world.bounds.height));
+  }
+  for (let y=0; y<scene.physics.world.bounds.height; y+=step) {
+    scene.zoneWorldG.strokeLineShape(new Phaser.Geom.Line(0,y,scene.physics.world.bounds.width,y));
+  }
+
+  // draw safe circle (on camera)
+  scene.zoneG.clear();
+  scene.zoneG.fillStyle(0x000000, 0.45);
+  // full screen dark overlay then cut circle
+  const cam = scene.cameras.main;
+  const cx = scene.safeCenter.x - cam.scrollX;
+  const cy = scene.safeCenter.y - cam.scrollY;
+  // darken entire screen
+  scene.zoneG.fillRect(0,0,cam.width,cam.height);
+  // punch hole (safe zone)
+  scene.zoneG.beginPath();
+  scene.zoneG.fillStyle(0x000000, 0);
+  scene.zoneG.globalCompositeOperation = 'destination-out';
+  scene.zoneG.arc(cx, cy, scene.safeRadius, 0, Math.PI*2);
+  scene.zoneG.fillPath();
+  scene.zoneG.globalCompositeOperation = 'source-over';
+  // draw safe border
+  scene.zoneG.lineStyle(4, 0x88c0ff, 0.9);
+  scene.zoneG.strokeCircle(cx, cy, scene.safeRadius);
+}
+</script>
+</body>
+</html>
